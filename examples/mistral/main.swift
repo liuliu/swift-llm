@@ -136,6 +136,12 @@ graph.withNoGrad {
   }
   var tuple = transformer((cachedTokenLength: 0, tokenLength: 5), inputs: tokensTensorGPU, [rotTensorGPU] + kvs).map { $0.as(of: Float16.self) }
   kvs = Array(tuple[1..<65])
+  let kvs100 = kvs.map {
+    let v = graph.variable(.GPU(0), .NHWC($0.shape[0], 64, $0.shape[2], $0.shape[3]), of: Float16.self)
+    v.full(0)
+    return v
+  }
+  let _ = transformer((cachedTokenLength: 64, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU] + kvs100)
   var nextToken = tuple[0].toCPU()
   var topV: Float16 = nextToken[4, 0]
   var topK = 0
