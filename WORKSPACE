@@ -3,9 +3,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 git_repository(
     name = "s4nnc",
-    commit = "328e56d1e13de18aaaf24854ec9c4cc525e566a7",
+    commit = "0f94004b5c8736794f9be39e5c786ea6ca75e1d1",
     remote = "https://github.com/liuliu/s4nnc.git",
-    shallow_since = "1703191991 -0500",
+    shallow_since = "1703280878 -0500",
 )
 
 load("@s4nnc//:deps.bzl", "s4nnc_deps")
@@ -48,9 +48,9 @@ swift_fickling_deps()
 
 git_repository(
     name = "swift-sentencepiece",
-    commit = "2c4ec57bea836f8b420179ee7670304a4972c572",
+    commit = "630838092954e76b4f0f399216d3cd01029a77a3",
     remote = "https://github.com/liuliu/swift-sentencepiece.git",
-    shallow_since = "1683864360 -0400",
+    shallow_since = "1703546720 -0500",
 )
 
 load("@swift-sentencepiece//:deps.bzl", "swift_sentencepiece_deps")

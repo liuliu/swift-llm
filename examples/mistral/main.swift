@@ -1,5 +1,6 @@
 import Foundation
 import NNC
+import SentencePiece
 
 public enum PythonObject {}
 
@@ -112,14 +113,15 @@ graph.withNoGrad {
   graph.maxConcurrency = .limit(1)
   transformer.maxConcurrency = .limit(1)
   var kvs = (0..<64).map { _ in graph.variable(.GPU(0), format: .NHWC, shape: [], of: Float16.self) }
-  var tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [5], of: Int32.self)
+  let sentencePiece = SentencePiece(file: "/home/liu/workspace/mistral-src/mistral-7B-v0.1/tokenizer.model")
+  var ids = sentencePiece.encode("This is a test").map { $0.id }
+  var tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [ids.count + 1], of: Int32.self)
   tokensTensor[0] = 1
-  tokensTensor[1] = 851
-  tokensTensor[2] = 349
-  tokensTensor[3] = 264
-  tokensTensor[4] = 1369
-  var rotTensor = graph.variable(.CPU, .NHWC(1, 5, 1, 128), of: Float.self)
-  for i in 0..<5 {
+  for i in 0..<ids.count {
+    tokensTensor[i + 1] = ids[i]
+  }
+  var rotTensor = graph.variable(.CPU, .NHWC(1, ids.count + 1, 1, 128), of: Float.self)
+  for i in 0..<(ids.count + 1) {
     for k in 0..<64 {
       let theta = Double(i) * 1.0 / pow(10_000, Double(k) * 2 / 128)
       let sintheta = sin(theta)
@@ -130,52 +132,57 @@ graph.withNoGrad {
   }
   var tokensTensorGPU = tokensTensor.toGPU(0)
   var rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
-  transformer.compile((cachedTokenLength: 0, tokenLength: 5), inputs: [tokensTensorGPU, rotTensorGPU] + kvs)
+  transformer.compile((cachedTokenLength: 0, tokenLength: ids.count + 1), inputs: [tokensTensorGPU, rotTensorGPU] + kvs)
   graph.openStore("/home/liu/workspace/swift-llm/mistral_7b_v0.1_f16.ckpt", flags: .readOnly) {
     $0.read("transformer", model: transformer)
   }
-  var tuple = transformer((cachedTokenLength: 0, tokenLength: 5), inputs: tokensTensorGPU, [rotTensorGPU] + kvs).map { $0.as(of: Float16.self) }
+  var tuple = transformer((cachedTokenLength: 0, tokenLength: ids.count + 1), inputs: tokensTensorGPU, [rotTensorGPU] + kvs).map { $0.as(of: Float16.self) }
   kvs = Array(tuple[1..<65])
   let kvs100 = kvs.map {
     let v = graph.variable(.GPU(0), .NHWC($0.shape[0], 64, $0.shape[2], $0.shape[3]), of: Float16.self)
     v.full(0)
     return v
   }
-  let _ = transformer((cachedTokenLength: 64, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU] + kvs100)
   var nextToken = tuple[0].toCPU()
-  var topV: Float16 = nextToken[4, 0]
+  var topV: Float16 = nextToken[ids.count, 0]
   var topK = 0
   for i in 1..<32_000 {
-    if nextToken[4, i] > topV {
+    if nextToken[ids.count, i] > topV {
       topK = i
-      topV = nextToken[4, i]
+      topV = nextToken[ids.count, i]
     }
   }
-  tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [1], of: Int32.self)
-  tokensTensor[0] = Int32(topK)
-  rotTensor = graph.variable(.CPU, .NHWC(1, 1, 1, 128), of: Float.self)
-  for k in 0..<64 {
-      let theta = Double(5) * 1.0 / pow(10_000, Double(k) * 2 / 128)
-      let sintheta = sin(theta)
-      let costheta = cos(theta)
-      rotTensor[0, 0, 0, k * 2] = Float(costheta)
-      rotTensor[0, 0, 0, k * 2 + 1] = Float(sintheta)
-  }
-  tokensTensorGPU = tokensTensor.toGPU(0)
-  rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
+  ids.append(Int32(topK))
+  transformer.compile((cachedTokenLength: 64, tokenLength: 1), inputs: [tokensTensorGPU, rotTensorGPU] + kvs100, isEager: true)
   let startTime = Date()
-  tuple = transformer((cachedTokenLength: 5, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU] + kvs).map { $0.as(of: Float16.self) }
-  print("time \(Date().timeIntervalSince(startTime))")
-  kvs = Array(tuple[1..<65])
-  nextToken = tuple[0].toCPU()
-  topV = nextToken[0, 0]
-  topK = 0
-  for i in 1..<32_000 {
-    if nextToken[0, i] > topV {
-      topK = i
-      topV = nextToken[0, i]
+  let maxTokens = 35
+  for _ in 0..<maxTokens {
+    tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [1], of: Int32.self)
+    tokensTensor[0] = Int32(topK)
+    rotTensor = graph.variable(.CPU, .NHWC(1, 1, 1, 128), of: Float.self)
+    let cachedTokenLength = ids.count
+    for k in 0..<64 {
+        let theta = Double(cachedTokenLength) * 1.0 / pow(10_000, Double(k) * 2 / 128)
+        let sintheta = sin(theta)
+        let costheta = cos(theta)
+        rotTensor[0, 0, 0, k * 2] = Float(costheta)
+        rotTensor[0, 0, 0, k * 2 + 1] = Float(sintheta)
     }
+    tokensTensorGPU = tokensTensor.toGPU(0)
+    rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
+    tuple = transformer((cachedTokenLength: cachedTokenLength, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU] + kvs).map { $0.as(of: Float16.self) }
+    kvs = Array(tuple[1..<65])
+    nextToken = tuple[0].toCPU()
+    topV = nextToken[0, 0]
+    topK = 0
+    for i in 1..<32_000 {
+      if nextToken[0, i] > topV {
+        topK = i
+        topV = nextToken[0, i]
+      }
+    }
+    ids.append(Int32(topK))
   }
-  print("next top k \(topK)")
-  
+  print("\(Double(maxTokens) / Date().timeIntervalSince(startTime)) tok/s")
+  print(sentencePiece.decode(ids))
 }
