@@ -9,6 +9,7 @@ func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: (Int, Int
 ) {
   let x = Input()
   let rot = Input()
+  let causalAttentionMask = Input()
   let tokeys = Dense(count: k * hk, noBias: true, name: "k_proj")
   let toqueries = Dense(count: k * h, noBias: true, name: "q_proj")
   let tovalues = Dense(count: k * hk, noBias: true, name: "v_proj")
@@ -21,12 +22,12 @@ func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: (Int, Int
   keys = Functional.cmul(left: keys, right: rot)
   let kOut = Functional.concat(axis: 1, kIn, keys)
   let vOut = Functional.concat(axis: 1, vIn, values)
-  var out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), isCausal: true)(queries, kOut, vOut).reshaped([b * t.1, h * k])
+  var out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), isCausal: true, hasAttentionMask: true)(queries, kOut, vOut, causalAttentionMask).reshaped([b * t.1, h * k])
   let unifyheads = Dense(count: k * h, noBias: true, name: "out_proj")
   out = unifyheads(out)
   let reader: (PythonObject) -> Void = { _ in
   }
-  return (Model([x, rot, kIn, vIn], [out, kOut, vOut]), reader)
+  return (Model([x, rot, causalAttentionMask, kIn, vIn], [out, kOut, vOut]), reader)
 }
 
 func FeedForward(hiddenSize: Int, intermediateSize: Int, name: String = "") -> (Model, Model, Model, Model) {
@@ -44,12 +45,13 @@ func TransformerBlock(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: (Int, 
 ) {
   let x = Input()
   let rot = Input()
+  let causalAttentionMask = Input()
   let kIn = Input()
   let vIn = Input()
   let norm1 = RMSNorm(epsilon: 1e-5, axis: [1], name: "attention_norm")
   var out = norm1(x)
   let (attention, _) = SelfAttention(prefix: prefix, k: k, h: h, hk: hk, b: b, t: t)
-  let tuple = attention(out, rot, kIn, vIn)
+  let tuple = attention(out, rot, causalAttentionMask, kIn, vIn)
   out = tuple[0] + x
   let kOut = tuple[1]
   let vOut = tuple[2]
@@ -60,7 +62,7 @@ func TransformerBlock(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: (Int, 
   out = residual + ffn(out)
   let reader: (PythonObject) -> Void = { _ in
   }
-  return (Model([x, rot, kIn, vIn], [out, kOut, vOut]), reader)
+  return (Model([x, rot, causalAttentionMask, kIn, vIn], [out, kOut, vOut]), reader)
 }
 
 public func TextEmbedding<T: TensorNumeric>(
@@ -80,6 +82,7 @@ func Transformer<T: TensorNumeric>(
 ) -> Model {
   let tokens = Input()
   let rot = Input()
+  let causalAttentionMask = Input()
   var kvs = [Input]()
   var kvOuts = [Model.IO]()
   let (embedding, _) = TextEmbedding(
@@ -91,7 +94,7 @@ func Transformer<T: TensorNumeric>(
       MLP: MLP)
     let kIn = Input()
     let vIn = Input()
-    let tuple = layer(out, rot, kIn, vIn)
+    let tuple = layer(out, rot, causalAttentionMask, kIn, vIn)
     out = tuple[0]
     kvs.append(kIn)
     kvs.append(vIn)
@@ -102,7 +105,7 @@ func Transformer<T: TensorNumeric>(
   out = norm(out)
   let output = Dense(count: vocabularySize, noBias: true, name: "output")
   out = output(out)
-  return Model([tokens, rot] + kvs, [out] + kvOuts)
+  return Model([tokens, rot, causalAttentionMask] + kvs, [out] + kvOuts)
 }
 
 let graph = DynamicGraph()
@@ -113,7 +116,7 @@ graph.withNoGrad {
   graph.maxConcurrency = .limit(1)
   transformer.maxConcurrency = .limit(1)
   var kvs = (0..<64).map { _ in graph.variable(.GPU(0), format: .NHWC, shape: [], of: Float16.self) }
-  let sentencePiece = SentencePiece(file: "/home/liu/workspace/mistral-src/mistral-7B-v0.1/tokenizer.model")
+  let sentencePiece = SentencePiece(file: "/Users/liu/workspace/swift-llm/examples/mistral/tokenizer.model")
   var ids = sentencePiece.encode("This is a test").map { $0.id }
   var tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [ids.count + 1], of: Int32.self)
   tokensTensor[0] = 1
@@ -130,13 +133,22 @@ graph.withNoGrad {
       rotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
     }
   }
+  var causalAttentionMask = graph.variable(
+    .CPU, .NHWC(1, 1, ids.count + 1, ids.count + 1), of: Float16.self)
+  causalAttentionMask.full(0)
+  for i in 0..<ids.count {
+    for j in (i + 1)..<(ids.count + 1) {
+      causalAttentionMask[0, 0, i, j] = -Float16.greatestFiniteMagnitude
+    }
+  }
+  var causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
   var tokensTensorGPU = tokensTensor.toGPU(0)
   var rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
-  transformer.compile((cachedTokenLength: 0, tokenLength: ids.count + 1), inputs: [tokensTensorGPU, rotTensorGPU] + kvs)
-  graph.openStore("/home/liu/workspace/swift-llm/mistral_7b_v0.1_f16.ckpt", flags: .readOnly) {
+  transformer.compile((cachedTokenLength: 0, tokenLength: ids.count + 1), inputs: [tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU] + kvs)
+  graph.openStore("/Users/liu/workspace/swift-llm/mistral_7b_v0.1_f16.ckpt", flags: .readOnly) {
     $0.read("transformer", model: transformer)
   }
-  var tuple = transformer((cachedTokenLength: 0, tokenLength: ids.count + 1), inputs: tokensTensorGPU, [rotTensorGPU] + kvs).map { $0.as(of: Float16.self) }
+  var tuple = transformer((cachedTokenLength: 0, tokenLength: ids.count + 1), inputs: tokensTensorGPU, [rotTensorGPU, causalAttentionMaskGPU] + kvs).map { $0.as(of: Float16.self) }
   kvs = Array(tuple[1..<65])
   let kvs100 = kvs.map {
     let v = graph.variable(.GPU(0), .NHWC($0.shape[0], 64, $0.shape[2], $0.shape[3]), of: Float16.self)
@@ -144,6 +156,7 @@ graph.withNoGrad {
     return v
   }
   var nextToken = tuple[0].toCPU()
+  debugPrint(nextToken)
   var topV: Float16 = nextToken[ids.count, 0]
   var topK = 0
   for i in 1..<32_000 {
@@ -153,7 +166,11 @@ graph.withNoGrad {
     }
   }
   ids.append(Int32(topK))
-  transformer.compile((cachedTokenLength: 64, tokenLength: 1), inputs: [tokensTensorGPU, rotTensorGPU] + kvs100, isEager: true)
+  causalAttentionMask = graph.variable(
+    .CPU, .NHWC(1, 1, 1, 65), of: Float16.self)
+  causalAttentionMask.full(0)
+  causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
+  transformer.compile((cachedTokenLength: 64, tokenLength: 1), inputs: [tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU] + kvs100, isEager: true)
   let startTime = Date()
   let maxTokens = 35
   for _ in 0..<maxTokens {
@@ -168,9 +185,13 @@ graph.withNoGrad {
         rotTensor[0, 0, 0, k * 2] = Float(costheta)
         rotTensor[0, 0, 0, k * 2 + 1] = Float(sintheta)
     }
+    causalAttentionMask = graph.variable(
+      .CPU, .NHWC(1, 1, 1, ids.count + 1), of: Float16.self)
+    causalAttentionMask.full(0)
+    causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
     tokensTensorGPU = tokensTensor.toGPU(0)
     rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
-    tuple = transformer((cachedTokenLength: cachedTokenLength, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU] + kvs).map { $0.as(of: Float16.self) }
+    tuple = transformer((cachedTokenLength: cachedTokenLength, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU, causalAttentionMaskGPU] + kvs).map { $0.as(of: Float16.self) }
     kvs = Array(tuple[1..<65])
     nextToken = tuple[0].toCPU()
     topV = nextToken[0, 0]
@@ -182,6 +203,7 @@ graph.withNoGrad {
       }
     }
     ids.append(Int32(topK))
+    print(sentencePiece.decode(ids))
   }
   print("\(Double(maxTokens) / Date().timeIntervalSince(startTime)) tok/s")
   print(sentencePiece.decode(ids))

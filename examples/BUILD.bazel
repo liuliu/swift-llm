@@ -14,6 +14,9 @@ swift_binary(
 swift_binary(
     name = "mistral",
     srcs = ["mistral/main.swift"],
+    data = [
+        "mistral/tokenizer.model",
+    ],
     deps = [
         "@SwiftNumerics//:Numerics",
         "@s4nnc//nnc",
