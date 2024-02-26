@@ -112,8 +112,8 @@ graph.withNoGrad {
   let transformer = ModelBuilder { (tokenLengths: (cachedTokenLength: Int, tokenLength: Int), _) in
     return Transformer(Float16.self, vocabularySize: 32_000, width: 4_096, tokenLength: tokenLengths.tokenLength, cachedTokenLength: tokenLengths.cachedTokenLength, layers: 32, MLP: 14336, heads: 32, batchSize: 1)
   }
-  graph.maxConcurrency = .limit(1)
-  transformer.maxConcurrency = .limit(1)
+  graph.maxConcurrency = .limit(8)
+  transformer.maxConcurrency = .limit(8)
   let kvs = (0..<64).map { _ in
     graph.variable(.GPU(0), .NHWC(1, 129, 8, 128), of: Float16.self)
   }
@@ -171,6 +171,7 @@ graph.withNoGrad {
   transformer.compile((cachedTokenLength: 128, tokenLength: 1), inputs: [tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU] + kvs, isEager: true)
   let startTime = Date()
   let maxTokens = 128 - ids.count
+  let stream = StreamContext(.GPU(0))
   DynamicGraph.setProfiler(true)
   for _ in 0..<maxTokens {
     tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [1], of: Int32.self)
@@ -187,14 +188,17 @@ graph.withNoGrad {
     causalAttentionMask = graph.variable(
       .CPU, .NHWC(1, 1, 1, ids.count + 1), of: Float16.self)
     causalAttentionMask.full(0)
-    causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
-    tokensTensorGPU = tokensTensor.toGPU(0)
-    rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
-    currentKvs = kvs.map {
-      $0.reshaped(.NHWC(1, cachedTokenLength + 1, 8, 128))
+    graph.withStream(stream) {
+      causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
+      tokensTensorGPU = tokensTensor.toGPU(0)
+      rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
+      currentKvs = kvs.map {
+        $0.reshaped(.NHWC(1, cachedTokenLength + 1, 8, 128))
+      }
+      tuple = transformer((cachedTokenLength: cachedTokenLength, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU, causalAttentionMaskGPU] + currentKvs).map { $0.as(of: Float16.self) }
+      nextToken = tuple[0].toCPU()
     }
-    tuple = transformer((cachedTokenLength: cachedTokenLength, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU, causalAttentionMaskGPU] + currentKvs).map { $0.as(of: Float16.self) }
-    nextToken = tuple[0].toCPU()
+    stream.joined()
     topV = nextToken[0, 0]
     topK = 0
     for i in 1..<32_000 {
