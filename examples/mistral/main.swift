@@ -153,7 +153,7 @@ graph.withNoGrad {
     $0.read("transformer", model: transformer)
   }
   var tuple = transformer((cachedTokenLength: 0, tokenLength: ids.count + 1), inputs: tokensTensorGPU, [rotTensorGPU, causalAttentionMaskGPU] + currentKvs).map { $0.as(of: Float16.self) }
-  var nextToken = tuple[0].toCPU()
+  let nextToken = tuple[0].toCPU()
   debugPrint(nextToken)
   var topV: Float16 = nextToken[ids.count, 0]
   var topK = 0
@@ -171,7 +171,6 @@ graph.withNoGrad {
   transformer.compile((cachedTokenLength: 128, tokenLength: 1), inputs: [tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU] + kvs, isEager: true)
   let startTime = Date()
   let maxTokens = 128 - ids.count
-  let stream = StreamContext(.GPU(0))
   DynamicGraph.setProfiler(true)
   for _ in 0..<maxTokens {
     tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [1], of: Int32.self)
@@ -188,25 +187,15 @@ graph.withNoGrad {
     causalAttentionMask = graph.variable(
       .CPU, .NHWC(1, 1, 1, ids.count + 1), of: Float16.self)
     causalAttentionMask.full(0)
-    graph.withStream(stream) {
-      causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
-      tokensTensorGPU = tokensTensor.toGPU(0)
-      rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
-      currentKvs = kvs.map {
-        $0.reshaped(.NHWC(1, cachedTokenLength + 1, 8, 128))
-      }
-      tuple = transformer((cachedTokenLength: cachedTokenLength, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU, causalAttentionMaskGPU] + currentKvs).map { $0.as(of: Float16.self) }
-      nextToken = tuple[0].toCPU()
+    causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
+    tokensTensorGPU = tokensTensor.toGPU(0)
+    rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
+    currentKvs = kvs.map {
+      $0.reshaped(.NHWC(1, cachedTokenLength + 1, 8, 128))
     }
-    stream.joined()
-    topV = nextToken[0, 0]
-    topK = 0
-    for i in 1..<32_000 {
-      if nextToken[0, i] > topV {
-        topK = i
-        topV = nextToken[0, i]
-      }
-    }
+    tuple = transformer((cachedTokenLength: cachedTokenLength, tokenLength: 1), inputs: tokensTensorGPU, [rotTensorGPU, causalAttentionMaskGPU] + currentKvs).map { $0.as(of: Float16.self) }
+    let nextToken = Functional.argmax(tuple[0], axis: 1).toCPU()
+    topK = Int(nextToken[0, 0])
     ids.append(Int32(topK))
   }
   print("\(Double(maxTokens) / Date().timeIntervalSince(startTime)) tok/s")
