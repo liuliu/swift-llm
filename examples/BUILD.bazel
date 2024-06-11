@@ -34,3 +34,25 @@ swift_binary(
         "@s4nnc//nnc:nnc_python",
     ],
 )
+
+swift_binary(
+    name = "t5_small",
+    srcs = ["t5_small/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "t5_xxl",
+    srcs = ["t5_xxl/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
