@@ -105,11 +105,11 @@ func T5Block(
 
 func T5ForConditionalGeneration() -> ((PythonObject) -> Void, Model) {
   let x = Input()
-  let relativePositionBucket = Input()
+  let relativePositionBuckets = Input()
   let textEmbed = T5TextEmbedding(vocabularySize: 32_128, embeddingSize: 4_096)
   var out = textEmbed(x)
   let relativePositionEmbedding = Embedding(Float.self, vocabularySize: 32, embeddingSize: 64)
-  let positionBias = relativePositionEmbedding(relativePositionBucket).reshaped([1, 13, 13, 64])
+  let positionBias = relativePositionEmbedding(relativePositionBuckets).reshaped([1, 13, 13, 64])
     .permuted(0, 3, 1, 2)
   var readers = [(PythonObject) -> Void]()
   for i in 0..<24 {
@@ -136,7 +136,7 @@ func T5ForConditionalGeneration() -> ((PythonObject) -> Void, Model) {
       .numpy()
     finalNorm.weight.copy(from: try! Tensor<Float>(numpy: final_layer_norm_weight))
   }
-  return (reader, Model([x, relativePositionBucket], [out]))
+  return (reader, Model([x, relativePositionBuckets], [out]))
 }
 
 let graph = DynamicGraph()
@@ -155,28 +155,45 @@ tokensTensor[10] = 388
 tokensTensor[11] = 5
 tokensTensor[12] = 1
 
+func relativePositionBuckets(sequenceLength: Int, numBuckets: Int, maxDistance: Int) -> Tensor<
+  Int32
+> {
+  // isBidirectional = true.
+  let numBuckets = numBuckets / 2
+  let maxExact = numBuckets / 2
+  var relativePositionBuckets = Tensor<Int32>(.CPU, .C(sequenceLength * sequenceLength))
+  for i in 0..<sequenceLength {
+    for j in 0..<sequenceLength {
+      var relativePositionBucket = j > i ? numBuckets : 0
+      let relativePosition = abs(i - j)
+      let isSmall = relativePosition < maxExact
+      if isSmall {
+        relativePositionBucket += relativePosition
+      } else {
+        let relativePositionIfLarge = min(
+          numBuckets - 1,
+          maxExact
+            + Int(
+              (log(Double(relativePosition) / Double(maxExact))
+                / log(Double(maxDistance) / Double(maxExact)) * Double(numBuckets - maxExact))
+                .rounded(.down)))
+        relativePositionBucket += relativePositionIfLarge
+      }
+      relativePositionBuckets[i * sequenceLength + j] = Int32(relativePositionBucket)
+    }
+  }
+  return relativePositionBuckets
+}
+
 graph.withNoGrad {
   let (reader, textModel) = T5ForConditionalGeneration()
-  let relativePositionBucket = Tensor<Int32>(
-    [
-      0, 17, 18, 19, 20, 21, 22, 23, 24, 24, 24, 24, 25,
-      1, 0, 17, 18, 19, 20, 21, 22, 23, 24, 24, 24, 24,
-      2, 1, 0, 17, 18, 19, 20, 21, 22, 23, 24, 24, 24,
-      3, 2, 1, 0, 17, 18, 19, 20, 21, 22, 23, 24, 24,
-      4, 3, 2, 1, 0, 17, 18, 19, 20, 21, 22, 23, 24,
-      5, 4, 3, 2, 1, 0, 17, 18, 19, 20, 21, 22, 23,
-      6, 5, 4, 3, 2, 1, 0, 17, 18, 19, 20, 21, 22,
-      7, 6, 5, 4, 3, 2, 1, 0, 17, 18, 19, 20, 21,
-      8, 7, 6, 5, 4, 3, 2, 1, 0, 17, 18, 19, 20,
-      8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 17, 18, 19,
-      8, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 17, 18,
-      8, 8, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 17,
-      9, 8, 8, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0,
-    ], .CPU, .C(13 * 13))
+  let relativePositionBuckets = relativePositionBuckets(
+    sequenceLength: 13, numBuckets: 32, maxDistance: 128)
+  debugPrint(relativePositionBuckets)
   let tokensTensorGPU = tokensTensor.toGPU(0)
-  let relativePositionBucketGPU = graph.variable(relativePositionBucket.toGPU(0))
-  textModel.compile(inputs: tokensTensorGPU, relativePositionBucketGPU)
+  let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
+  textModel.compile(inputs: tokensTensorGPU, relativePositionBucketsGPU)
   reader(state_dict)
-  let output = textModel(inputs: tokensTensorGPU, relativePositionBucketGPU)[0].as(of: Float.self)
+  let output = textModel(inputs: tokensTensorGPU, relativePositionBucketsGPU)[0].as(of: Float.self)
   debugPrint(output)
 }
