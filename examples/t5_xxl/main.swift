@@ -6,8 +6,6 @@ import PythonKit
 let torch = Python.import("torch")
 let transformers = Python.import("transformers")
 
-print(transformers.T5Tokenizer)
-
 let tokenizer = transformers.T5Tokenizer.from_pretrained("google/t5-v1_1-xxl")
 let model = transformers.T5ForConditionalGeneration.from_pretrained(
   "google/t5-v1_1-xxl", device_map: "auto")
@@ -23,9 +21,9 @@ print(state_dict.keys())
 let outputs = model.generate(input_ids, max_new_tokens: 1)
 print(tokenizer.decode(outputs[0]))
 
-func T5TextEmbedding(vocabularySize: Int, embeddingSize: Int) -> Model {
+func T5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
   let tokenEmbed = Embedding(
-    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize)
+    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
   return tokenEmbed
 }
 
@@ -34,9 +32,9 @@ func T5LayerSelfAttention(k: Int, h: Int, b: Int, t: Int, outFeatures: Int) -> (
 ) {
   let x = Input()
   let positionBias = Input()
-  let tokeys = Dense(count: k * h, noBias: true)
-  let toqueries = Dense(count: k * h, noBias: true)
-  let tovalues = Dense(count: k * h, noBias: true)
+  let tokeys = Dense(count: k * h, noBias: true, name: "k")
+  let toqueries = Dense(count: k * h, noBias: true, name: "q")
+  let tovalues = Dense(count: k * h, noBias: true, name: "v")
   let keys = tokeys(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   // No scaling the queries.
   let queries = toqueries(x).reshaped([b, t, h, k])
@@ -48,19 +46,19 @@ func T5LayerSelfAttention(k: Int, h: Int, b: Int, t: Int, outFeatures: Int) -> (
   dot = dot.reshaped([b, h, t, t])
   var out = dot * values
   out = out.reshaped([b, h, t, k]).transposed(1, 2).reshaped([b * t, h * k])
-  let unifyheads = Dense(count: outFeatures, noBias: true)
+  let unifyheads = Dense(count: outFeatures, noBias: true, name: "o")
   out = unifyheads(out)
   return (tokeys, toqueries, tovalues, unifyheads, Model([x, positionBias], [out]))
 }
 
 func T5DenseGatedActDense(hiddenSize: Int, intermediateSize: Int) -> (Model, Model, Model, Model) {
   let x = Input()
-  let wi_0 = Dense(count: intermediateSize, noBias: true)
-  let wi_1 = Dense(count: intermediateSize, noBias: true)
+  let wi_0 = Dense(count: intermediateSize, noBias: true, name: "w0")
+  let wi_1 = Dense(count: intermediateSize, noBias: true, name: "w1")
   var out = wi_1(x) .* wi_0(x).GELU(approximate: .tanh)
-  let wo = Dense(count: hiddenSize, noBias: true)
+  let wo = Dense(count: hiddenSize, noBias: true, name: "wo")
   out = wo(out)
-  return (wi_0, wi_1, wo, Model([x], [out], name: "ff"))
+  return (wi_0, wi_1, wo, Model([x], [out]))
 }
 
 func T5Block(
@@ -68,11 +66,11 @@ func T5Block(
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let positionBias = Input()
-  let norm1 = RMSNorm(epsilon: 1e-6, axis: [1])
+  let norm1 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm1")
   let (tokeys, toqueries, tovalues, unifyheads, attention) = T5LayerSelfAttention(
     k: k, h: h, b: b, t: t, outFeatures: outFeatures)
   var out = x + attention(norm1(x), positionBias)
-  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1])
+  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm2")
   let (wi_0, wi_1, wo, ff) = T5DenseGatedActDense(
     hiddenSize: outFeatures, intermediateSize: intermediateSize)
   out = out + ff(norm2(out))
@@ -106,9 +104,10 @@ func T5Block(
 func T5ForConditionalGeneration() -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let relativePositionBuckets = Input()
-  let textEmbed = T5TextEmbedding(vocabularySize: 32_128, embeddingSize: 4_096)
+  let textEmbed = T5TextEmbedding(vocabularySize: 32_128, embeddingSize: 4_096, name: "shared")
   var out = textEmbed(x)
-  let relativePositionEmbedding = Embedding(Float.self, vocabularySize: 32, embeddingSize: 64)
+  let relativePositionEmbedding = Embedding(
+    Float.self, vocabularySize: 32, embeddingSize: 64, name: "relative_position_embedding")
   let positionBias = relativePositionEmbedding(relativePositionBuckets).reshaped([1, 13, 13, 64])
     .permuted(0, 3, 1, 2)
   var readers = [(PythonObject) -> Void]()
@@ -119,7 +118,7 @@ func T5ForConditionalGeneration() -> ((PythonObject) -> Void, Model) {
     out = block(out, positionBias)
     readers.append(reader)
   }
-  let finalNorm = RMSNorm(epsilon: 1e-6, axis: [1])
+  let finalNorm = RMSNorm(epsilon: 1e-6, axis: [1], name: "final_norm")
   out = finalNorm(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let vocab = state_dict["shared.weight"].cpu().float().numpy()
@@ -196,4 +195,7 @@ graph.withNoGrad {
   reader(state_dict)
   let output = textModel(inputs: tokensTensorGPU, relativePositionBucketsGPU)[0].as(of: Float.self)
   debugPrint(output)
+  graph.openStore("/home/liu/workspace/swift-llm/t5_xxl_encoder_f32.ckpt") {
+    $0.write("text_model", model: textModel)
+  }
 }
